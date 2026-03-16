@@ -302,60 +302,100 @@ function handleFile(file) {
 }
 
 // SQL 예약어 및 특수문자 정제
-function sanitize(str) {
+// SQL 예약어·특수문자 제거
+function sqlSanitize(str) {
   const sqlWords = ['OR','SELECT','INSERT','DELETE','UPDATE','CREATE','DROP','EXEC','UNION','FETCH','DECLARE','TRUNCATE'];
   let s = str.replace(/[%=><\[\]]/g, ' ').trim();
-  sqlWords.forEach(w => {
-    const re = new RegExp('\\b' + w + '\\b', 'gi');
-    s = s.replace(re, '');
-  });
+  sqlWords.forEach(w => { s = s.replace(new RegExp('\\b'+w+'\\b','gi'), ''); });
   return s.trim();
 }
 
-function searchAddr(keyword) {
+// 주소 전처리: 노이즈 제거 후 핵심 도로명+건물번호만 추출
+function extractCoreAddr(raw) {
+  let s = raw.trim();
+
+  // 1) 괄호 안 상호명·건물명 제거 (동명 제외: 1~3글자 + 동/읍/면/리 로 끝나는 건 보존)
+  s = s.replace(/\(([^)]*)\)/g, (m, inner) => {
+    if (/^.{1,5}(동|읍|면|리|가)$/.test(inner.trim())) return m;
+    return '';
+  });
+
+  // 2) 층·호수 제거 (지하X층, B1, X층, X호, 지층)
+  s = s.replace(/지하\s*\d+층/g, '');
+  s = s.replace(/[Bb]\s*\d+/g, '');
+  s = s.replace(/\d+\s*층/g, '');
+  s = s.replace(/지\s*층/g, '');
+  s = s.replace(/\d+\s*호/g, '');
+
+  // 3) 번지·지번 숫자 제거 (도로명 건물번호 뒤에 붙는 지번: 숫자-숫자 또는 숫자번지)
+  // 건물번호(도로명주소)는 도로명 바로 뒤 첫 번째 숫자이므로 이후 중복 숫자만 제거
+  s = s.replace(/\s+\d{2,6}(-\d+)?번지?/g, ' ');
+
+  // 4) 도로명 건물번호 이후 남은 숫자 덩어리 제거 (예: "119 1258-5" → "1258-5" 제거)
+  // 도로명주소 패턴: [도로명] [건물번호(-부번)] 이후 추가 숫자 제거
+  s = s.replace(/(\d+(-\d+)?)\s+\d{3,6}(-\d+)?(?=\s|$)/g, '$1');
+
+  // 5) 한글 상호명 제거 (마지막에 오는 2글자 이상 한글 덩어리, 주소 패턴 아닌 것)
+  // 도로/길/로 가 포함되지 않은 순수 한글 단어들 제거
+  s = s.replace(/\s+[가-힣]{2,15}(?:pc|PC|피시|피씨|방|카페|게임|넷|스|존|타운|빌딩|점|호점)[\w가-힣]*/gi, '');
+  s = s.replace(/\s+[a-zA-Z]{2,}[\s가-힣a-zA-Z]*(pc|cafe|PC|net)[\w]*/gi, '');
+
+  // 6) 앞뒤 정리
+  s = s.replace(/\s+/g, ' ').trim();
+
+  return s;
+}
+
+// 단계별 주소 후보 생성 (전처리 → 원본 순으로 시도)
+function buildCandidates(raw) {
+  const core = extractCoreAddr(raw);
+  const candidates = [];
+  if (core && core !== raw) candidates.push(core);
+  candidates.push(raw); // 원본도 시도
+  // 중복 제거
+  return [...new Set(candidates)];
+}
+
+// 단일 API 호출
+function callApi(keyword) {
   return new Promise((resolve) => {
-    const clean = sanitize(keyword);
-    if (!clean || clean.length < 2) {
-      resolve({ status: 'fail', original: keyword, roadAddr: '', zipNo: '', candidates: [] });
-      return;
-    }
+    const clean = sqlSanitize(keyword);
+    if (!clean || clean.length < 2) { resolve(null); return; }
     const cbName = 'jusoCallback_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    const timer = setTimeout(() => {
+      if (window[cbName]) { delete window[cbName]; resolve(null); }
+    }, 8000);
     window[cbName] = function(data) {
+      clearTimeout(timer);
       delete window[cbName];
       try {
         const common = data.results.common;
+        if (common.errorCode !== '0') { resolve(null); return; }
         const jusoList = data.results.juso || [];
-        if (common.errorCode !== '0') {
-          resolve({ status: 'fail', original: keyword, roadAddr: '', zipNo: '', candidates: [], errMsg: common.errorMessage });
-          return;
-        }
-        const total = parseInt(common.totalCount);
-        if (total === 0) {
-          resolve({ status: 'fail', original: keyword, roadAddr: '검색 결과 없음', zipNo: '', candidates: [] });
-        } else if (total === 1) {
-          resolve({ status: 'ok', original: keyword, roadAddr: jusoList[0].roadAddr, zipNo: jusoList[0].zipNo, candidates: jusoList });
-        } else {
-          resolve({ status: 'multi', original: keyword, roadAddr: jusoList[0].roadAddr, zipNo: jusoList[0].zipNo, candidates: jusoList, total });
-        }
-      } catch(e) {
-        resolve({ status: 'fail', original: keyword, roadAddr: '', zipNo: '', candidates: [] });
-      }
+        resolve({ total: parseInt(common.totalCount), jusoList });
+      } catch(e) { resolve(null); }
     };
-    const url = `https://business.juso.go.kr/addrlink/addrLinkApiJsonp.do?currentPage=1&countPerPage=5&keyword=${encodeURIComponent(clean)}&confmKey=${encodeURIComponent(CONFM_KEY)}&resultType=json&callback=${cbName}`;
     const script = document.createElement('script');
-    script.src = url;
-    script.onerror = function() {
-      delete window[cbName];
-      resolve({ status: 'fail', original: keyword, roadAddr: 'API 오류', zipNo: '', candidates: [] });
-    };
+    script.src = `https://business.juso.go.kr/addrlink/addrLinkApiJsonp.do?currentPage=1&countPerPage=5&keyword=${encodeURIComponent(clean)}&confmKey=${encodeURIComponent(CONFM_KEY)}&resultType=json&hstryYn=Y&callback=${cbName}`;
+    script.onerror = () => { clearTimeout(timer); delete window[cbName]; resolve(null); };
     document.head.appendChild(script);
-    setTimeout(() => {
-      if (window[cbName]) {
-        delete window[cbName];
-        resolve({ status: 'fail', original: keyword, roadAddr: '응답 시간 초과', zipNo: '', candidates: [] });
-      }
-    }, 8000);
   });
+}
+
+// 전처리 주소로 먼저 시도, 실패 시 원본 재시도
+async function searchAddr(keyword) {
+  const tries = buildCandidates(keyword);
+  for (let i = 0; i < tries.length; i++) {
+    const res = await callApi(tries[i]);
+    if (!res) continue;
+    if (res.total === 0) continue; // 다음 후보 시도
+    if (res.total === 1) {
+      return { status: 'ok', original: keyword, usedQuery: tries[i], roadAddr: res.jusoList[0].roadAddr, zipNo: res.jusoList[0].zipNo, candidates: res.jusoList };
+    }
+    // 복수 결과
+    return { status: 'multi', original: keyword, usedQuery: tries[i], roadAddr: res.jusoList[0].roadAddr, zipNo: res.jusoList[0].zipNo, candidates: res.jusoList, total: res.total };
+  }
+  return { status: 'fail', original: keyword, usedQuery: tries[0], roadAddr: '검색 결과 없음', zipNo: '', candidates: [] };
 }
 
 async function runQuery() {
@@ -384,8 +424,8 @@ async function runQuery() {
     renderTable();
     updateStats();
 
-    // API 부하 방지: 100ms 딜레이
-    if (i < addrs.length - 1) await new Promise(r => setTimeout(r, 120));
+    // API 부하 방지 딜레이 (전처리 실패 시 재시도 고려)
+    if (i < addrs.length - 1) await new Promise(r => setTimeout(r, 200));
   }
 
   document.getElementById('progress-wrap').style.display = 'none';
