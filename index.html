@@ -376,7 +376,7 @@ function callApi(keyword) {
       } catch(e) { resolve(null); }
     };
     const script = document.createElement('script');
-    script.src = `https://business.juso.go.kr/addrlink/addrLinkApiJsonp.do?currentPage=1&countPerPage=5&keyword=${encodeURIComponent(clean)}&confmKey=${encodeURIComponent(CONFM_KEY)}&resultType=json&hstryYn=Y&callback=${cbName}`;
+    script.src = `https://business.juso.go.kr/addrlink/addrLinkApiJsonp.do?currentPage=1&countPerPage=5&keyword=${encodeURIComponent(clean)}&confmKey=${CONFM_KEY}&resultType=json&hstryYn=Y&callback=${cbName}`;
     script.onerror = () => { clearTimeout(timer); delete window[cbName]; resolve(null); };
     document.head.appendChild(script);
   });
